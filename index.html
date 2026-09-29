@@ -1,0 +1,321 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Spektrum Interaktif</title>
+<style>
+  *{box-sizing:border-box;margin:0}
+  body{font-family:system-ui,sans-serif;background:#070a12;color:#e6e8ee;overflow:hidden}
+  #ui{position:fixed;top:0;left:0;right:0;display:flex;flex-wrap:wrap;gap:8px;padding:10px;background:#0f1320cc;backdrop-filter:blur(8px);z-index:2;align-items:center}
+  #ui input,button,select{font:inherit}
+  button,input[type=file]::file-selector-button,select{padding:6px 10px;border-radius:8px;border:1px solid #2a3350;background:#1a2035;color:#e6e8ee;cursor:pointer}
+  button.active{background:#4f6ef7;border-color:#4f6ef7}
+  button:disabled{opacity:.5;cursor:not-allowed}
+  label{font-size:13px;display:flex;gap:6px;align-items:center}
+  input[type=range]{width:90px}
+  #status{font-size:12px;opacity:.7}
+  audio{position:fixed;bottom:8px;left:8px;z-index:2;width:min(360px,90vw);display:none}
+  audio.show{display:block}
+  canvas{display:block;width:100vw;height:100vh}
+  #hint{position:fixed;bottom:10px;right:10px;font-size:11px;opacity:.5;z-index:2}
+</style>
+</head>
+<body>
+<div id="ui">
+  <input type="file" id="file" accept="audio/*"/>
+  <button id="btnMic">Mic OFF</button>
+  <button id="btnTab">Share Tab Audio</button>
+  <button id="btnPlay" disabled>Play</button>
+  <label>Sens <input type="range" id="sens" min="0.5" max="3" step="0.1" value="1.2"/></label>
+  <label>Bars <input type="range" id="bars" min="32" max="180" step="1" value="90"/></label>
+  <select id="mode"><option value="circle">Lingkaran + Particle</option><option value="bars">Bar Klasik</option></select>
+  <select id="theme"><option value="auto">Auto Reaktif</option><option value="neon">Neon</option><option value="fire">Fire</option><option value="ocean">Ocean</option><option value="mono">Mono</option></select>
+  <button id="btnFS">Fullscreen</button>
+  <span id="status">Upload MP3 / klik Share Tab Audio untuk Spotify</span>
+</div>
+<audio id="audio" controls crossorigin="anonymous"></audio>
+<canvas id="c"></canvas>
+<div id="hint">ponytail: BPM exact butuh autocorrelation — ini beat energy bass saja</div>
+<script>
+const c=document.getElementById('c'), ctx=c.getContext('2d')
+const audio=document.getElementById('audio'), fileI=document.getElementById('file')
+const btnMic=document.getElementById('btnMic'), btnTab=document.getElementById('btnTab'), btnPlay=document.getElementById('btnPlay'), btnFS=document.getElementById('btnFS')
+const sensI=document.getElementById('sens'), barsI=document.getElementById('bars'), modeI=document.getElementById('mode'), themeI=document.getElementById('theme'), statusEl=document.getElementById('status')
+
+let AC, analyser, monitorGain, src, data, streamMic=null, streamTab=null, playing=false
+let barCount=90, sens=1.2, mode='circle', theme='auto', beatScale=0, beatAt=0
+const particles=[]
+const THEMES={neon:{h:265,s:90}, fire:{h:14,s:95}, ocean:{h:200,s:85}, mono:{h:220,s:0}}
+
+function ensureAC(){
+  if(!AC) AC=new (window.AudioContext||window.webkitAudioContext)()
+  if(AC.state==='suspended') AC.resume()
+  if(!analyser){
+    analyser=AC.createAnalyser()
+    analyser.fftSize=1024
+    analyser.smoothingTimeConstant=0.82
+    data=new Uint8Array(analyser.frequencyBinCount)
+    monitorGain=AC.createGain()
+    monitorGain.gain.value=1
+    analyser.connect(monitorGain)
+    monitorGain.connect(AC.destination)
+  }
+}
+function setSource(node, monitor=true){
+  ensureAC()
+  try{ if(src) src.disconnect() }catch{}
+  src=node
+  src.connect(analyser)
+  if(monitorGain) monitorGain.gain.value=monitor?1:0
+}
+function setStatus(t){ statusEl.textContent=t }
+
+function resize(){
+  const dpr=Math.min(devicePixelRatio,2)
+  c.width=innerWidth*dpr; c.height=innerHeight*dpr
+  c.style.width=innerWidth+'px'; c.style.height=innerHeight+'px'
+  ctx.setTransform(dpr,0,0,dpr,0,0)
+}
+addEventListener('resize', resize); resize()
+
+// file upload
+fileI.onchange=e=>{
+  const f=e.target.files[0]; if(!f) return
+  stopStreams()
+  ensureAC()
+  audio.src=URL.createObjectURL(f)
+  audio.classList.add('show')
+  audio.oncanplay=()=>{
+    // MediaElementSource hanya sekali per elemen
+    if(!audio._src){
+      try{ audio._src=AC.createMediaElementSource(audio) }catch(err){ setStatus('Gagal tap audio: '+err.message); return }
+    }
+    setSource(audio._src)
+    audio.play(); playing=true; btnPlay.textContent='Pause'; btnPlay.disabled=false
+    setStatus('Playing: '+f.name)
+  }
+}
+audio.onplay=()=>{ ensureAC(); if(AC.state==='suspended') AC.resume(); playing=true; btnPlay.textContent='Pause' }
+audio.onpause=()=>{ playing=false; btnPlay.textContent='Play' }
+btnPlay.onclick=()=>{
+  if(!audio.src) return
+  if(playing) audio.pause(); else audio.play()
+}
+
+// mic
+btnMic.onclick=async()=>{
+  if(streamMic){
+    stopMic(); return
+  }
+  try{
+    ensureAC()
+    const s=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false}})
+    streamMic=s
+    stopTab()
+    audio.pause(); audio.classList.remove('show')
+    setSource(AC.createMediaStreamSource(s), false)
+    btnMic.textContent='Mic ON'; btnMic.classList.add('active')
+    setStatus('Mic aktif — bicara / putar speaker')
+  }catch(e){ setStatus('Mic gagal: '+e.message) }
+}
+function stopMic(){
+  if(streamMic) streamMic.getTracks().forEach(t=>t.stop())
+  streamMic=null; btnMic.textContent='Mic OFF'; btnMic.classList.remove('active')
+  if(!streamTab) setStatus('Mic off')
+}
+
+// tab audio (untuk Spotify / YouTube tab) — opsi B
+btnTab.onclick=async()=>{
+  if(streamTab){ stopTab(); return }
+  try{
+    ensureAC()
+    const s=await navigator.mediaDevices.getDisplayMedia({video:true, audio:true})
+    const aTracks=s.getVideoTracks(); // video wajib, tapi kita hentikan video biar hemat
+    // cek ada audio track?
+    if(!s.getAudioTracks().length){ s.getTracks().forEach(t=>t.stop()); setStatus('Pilih tab dan centang "Share tab audio"'); return }
+    // stop video track saja, keep audio
+    aTracks.forEach(t=>t.stop())
+    // buat stream audio-only
+    const audioOnly=new MediaStream(s.getAudioTracks())
+    streamTab=audioOnly
+    // hentikan original s video sudah, tapi audio track masih di audioOnly (clone ref sama, jadi jangan stop s)
+    stopMic()
+    audio.pause(); audio.classList.remove('show')
+    setSource(AC.createMediaStreamSource(audioOnly), false)
+    btnTab.textContent='Tab Audio ON'; btnTab.classList.add('active')
+    setStatus('Tab audio aktif — putar Spotify di tab yang di-share')
+    audioOnly.getAudioTracks()[0].onended=()=>stopTab()
+  }catch(e){
+    if(e.name!=='NotAllowedError') setStatus('Share tab gagal: '+e.message)
+  }
+}
+function stopTab(){
+  if(streamTab) streamTab.getTracks().forEach(t=>t.stop())
+  streamTab=null; btnTab.textContent='Share Tab Audio'; btnTab.classList.remove('active')
+  if(!streamMic) setStatus('Tab audio off')
+}
+function stopStreams(){ stopMic(); stopTab() }
+
+sensI.oninput=e=>sens=parseFloat(e.target.value)
+barsI.oninput=e=>barCount=parseInt(e.target.value,10)
+modeI.onchange=e=>mode=e.target.value
+themeI.onchange=e=>theme=e.target.value
+btnFS.onclick=()=>{ if(!document.fullscreenElement) c.requestFullscreen(); else document.exitFullscreen() }
+function themeHue(base, reactiveHue){
+  if(theme==='auto') return reactiveHue
+  const t=THEMES[theme]; if(!t) return reactiveHue
+  if(theme==='mono') return t.h
+  return t.h
+}
+function bandEnergies(){
+  if(!data) return {r:0,g:0,b:0,reactive:230}
+  const n=data.length
+  let r=0,g=0,b=0
+  for(let i=0;i<Math.floor(n*0.1);i++) r+=data[i]
+  for(let i=Math.floor(n*0.1);i<Math.floor(n*0.35);i++) g+=data[i]
+  for(let i=Math.floor(n*0.35);i<Math.floor(n*0.55);i++) b+=data[i]
+  r/=Math.max(1,Math.floor(n*0.1)); g/=Math.max(1,Math.floor(n*0.25)); b/=Math.max(1,Math.floor(n*0.2))
+  // dominant band -> hue: bass 12° (fire), mid 95° (lime), high 235° (blue)
+  const reactive = r>g&&r>b? 12 + g*0.2 : g>b? 88 + r*0.15 : 232 + b*0.08
+  return {r:r/255,g:g/255,b:b/255,reactive}
+}
+
+// particles
+function emit(n, cx, cy, energy, hueBase){
+  for(let i=0;i<n;i++){
+    const a=Math.random()*Math.PI*2, s=2+Math.random()*5*energy
+    const spread=theme==='mono'? 0 : 40
+    particles.push({x:cx,y:cy,vx:Math.cos(a)*s, vy:Math.sin(a)*s, life:1, r:1.5+Math.random()*3, hue: hueBase + (Math.random()-0.5)*spread})
+  }
+  if(particles.length>400) particles.splice(0, particles.length-400)
+}
+
+let lastT=0
+function drawAurora(t,w,h,cx,cy,energy,beat, reactiveHue){
+  const hueDrift=(t*0.008)%14
+  const h1=themeHue(0, (reactiveHue+hueDrift)%360)
+  const h2=themeHue(0, (reactiveHue+26+hueDrift)%360)
+  const sat=theme==='mono'?22:75
+  const g=ctx.createLinearGradient(0,0,0,h)
+  g.addColorStop(0,`hsl(${h1} ${sat}% ${10+energy*7+beat*6}%)`)
+  g.addColorStop(0.45,`hsl(${h2} ${Math.max(20,sat-7)}% ${7+energy*5+beat*2}%)`)
+  g.addColorStop(1,'#070a12')
+  ctx.fillStyle=g; ctx.fillRect(0,0,w,h)
+  ctx.globalCompositeOperation='screen'
+  for(let k=0;k<2;k++){
+    const ox=w*(0.28+k*0.44 + Math.sin(t*0.00028 + k*2.1)*0.07)
+    const oy=h*(0.32 + Math.cos(t*0.00022 + k*1.7)*0.07) - beat*14
+    const r=Math.min(w,h)*(0.42 + energy*0.22 + beat*0.12)
+    const rg=ctx.createRadialGradient(ox,oy,0,ox,oy,r)
+    const hue=k===0? h1 : (h2+18)%360
+    const s2=theme==='mono'? 18 : 90
+    rg.addColorStop(0,`hsla(${hue} ${s2}% 62% / ${0.22+energy*0.16+beat*0.16})`)
+    rg.addColorStop(0.45,`hsla(${hue} ${Math.max(12,s2-5)}% 58% / ${0.08+energy*0.05})`)
+    rg.addColorStop(1,'hsla(0 0% 0% / 0)')
+    ctx.fillStyle=rg; ctx.beginPath(); ctx.arc(ox,oy,r,0,Math.PI*2); ctx.fill()
+  }
+  ctx.globalCompositeOperation='source-over'
+  if(beat>0.25){
+    ctx.fillStyle=`rgba(255,255,255,${beat*0.05})`
+    ctx.fillRect(0,0,w,h)
+  }
+  const vig=ctx.createRadialGradient(cx,cy,Math.min(w,h)*0.28,cx,cy,Math.max(w,h)*0.9)
+  vig.addColorStop(0,'rgba(0,0,0,0)'); vig.addColorStop(1,'rgba(0,0,0,0.55)')
+  ctx.fillStyle=vig; ctx.fillRect(0,0,w,h)
+}
+function frame(t){
+  requestAnimationFrame(frame)
+  const w=innerWidth, h=innerHeight, cx=w/2, cy=h/2+18
+  const idleHue = theme==='auto'? 232 : THEMES[theme].h
+  if(!analyser){
+    drawAurora(t,w,h,cx,cy,0,0,idleHue)
+    ctx.fillStyle='#8a90a8'; ctx.textAlign='center'
+    ctx.font='14px system-ui'; ctx.fillText('Upload MP3 atau Share Tab Audio untuk mulai', cx, cy)
+    return
+  }
+  analyser.getByteFrequencyData(data)
+
+  // beat: bass 0..10 (~0-150Hz)
+  let bass=0; for(let i=0;i<10;i++) bass+=data[i]
+  bass/=10
+  const avg = data.reduce((a,b)=>a+b,0)/data.length
+  const be=bandEnergies()
+  const reactiveHue=be.reactive
+  const themedBase=themeHue(0, reactiveHue)
+  const satBar=theme==='mono'? 0 : 90
+  const isBeat = bass > avg*1.35 && bass>40 && (t - beatAt > 120)
+  if(isBeat){ beatAt=t; beatScale=1; if(mode==='circle') emit(10,cx,cy, bass/80, themedBase) }
+
+  beatScale *= 0.90
+  const energy=avg/255
+  drawAurora(t,w,h,cx,cy,energy,beatScale, reactiveHue)
+
+  const sensV=sens
+  if(mode==='bars'){
+    const bw=w/barCount
+    for(let i=0;i<barCount;i++){
+      const idx=Math.floor(i/data.length*data.length *0.7)
+      const v=data[idx]/255 * sensV
+      const bh=Math.max(4, v*(h*0.55))
+      const x=i*bw+1, y=h-bh
+      const hue= theme==='auto' ? (reactiveHue + v*45 + i*0.35)%360 : (themedBase + v*28 + i*0.18)%360
+      const s2=theme==='mono'? 0 : 90
+      ctx.fillStyle=`hsl(${hue} ${s2}% 60%)`
+      ctx.fillRect(x,y,bw-2,bh)
+    }
+    if(isBeat){ ctx.fillStyle=theme==='mono'?'rgba(255,255,255,0.06)':'rgba(120,140,255,0.08)'; ctx.fillRect(0,0,w,h) }
+  } else {
+    // circular
+    const baseR=Math.min(w,h)*0.18 + beatScale*18
+    const R2=baseR+6
+    // glow
+    if(beatScale>0.2){
+      ctx.beginPath(); ctx.arc(cx,cy, baseR-10,0,Math.PI*2)
+      ctx.fillStyle=theme==='mono'?`rgba(255,255,255,${beatScale*0.10})`:`hsla(${themedBase} 90% 62% / ${beatScale*0.18})`; ctx.fill()
+    }
+    for(let i=0;i<barCount;i++){
+      const idx=Math.floor(i/barCount* (data.length*0.6))
+      const v=data[idx]/255 * sensV
+      const len= 8 + v* Math.min(w,h)*0.28
+      const ang=(i/barCount)*Math.PI*2 - Math.PI/2
+      const x1=cx+Math.cos(ang)*R2, y1=cy+Math.sin(ang)*R2
+      const x2=cx+Math.cos(ang)*(R2+len), y2=cy+Math.sin(ang)*(R2+len)
+      const hue= theme==='auto' ? (reactiveHue + v*50 + i*0.2)%360 : (themedBase + v*32 + i*0.12)%360
+      const s3=theme==='mono'? 0 : 95
+      ctx.strokeStyle=`hsl(${hue} ${s3}% ${55+v*15}%)`
+      ctx.lineWidth=Math.max(1.5, (w/barCount)*0.55)
+      ctx.lineCap='round'
+      ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2); ctx.stroke()
+    }
+    // center circle
+    ctx.beginPath(); ctx.arc(cx,cy, baseR-22,0,Math.PI*2)
+    ctx.fillStyle='#0f1320'; ctx.fill()
+    const ringHue=theme==='mono'? 0 : themedBase
+    const ringS=theme==='mono'? '0%' : '90%'
+    ctx.strokeStyle=theme==='mono'?`rgba(255,255,255,${0.25+beatScale*0.35})`:`hsla(${ringHue} 90% 64% / ${0.45+beatScale*0.55})`; ctx.lineWidth=2; ctx.stroke()
+    // particles
+    for(let i=particles.length-1;i>=0;i--){
+      const p=particles[i]
+      p.x+=p.vx; p.y+=p.vy; p.vy+=0.08; p.vx*=0.99; p.life-=0.012
+      if(p.life<=0){ particles.splice(i,1); continue }
+      ctx.globalAlpha=p.life
+      ctx.fillStyle=`hsl(${p.hue} 90% 60%)`
+      ctx.beginPath(); ctx.arc(p.x,p.y,p.r,0,Math.PI*2); ctx.fill()
+    }
+    ctx.globalAlpha=1
+    // title
+    ctx.fillStyle='#cbd2ee'; ctx.textAlign='center'
+    ctx.font='12px system-ui'; ctx.fillText(mode==='circle'?'Lingkaran + Particle  •  beat = bass energy':'' ,cx, h-14)
+  }
+}
+requestAnimationFrame(frame)
+
+// auto-resume AC on any click
+addEventListener('click', ()=>{ if(AC&&AC.state==='suspended') AC.resume() }, {once:false})
+
+// self-check (hapus jika mengganggu): assert helpers exist
+console.assert(typeof AnalyserNode!=='undefined' || typeof AC==='undefined', 'Web Audio ok')
+</script>
+</body>
+</html>
